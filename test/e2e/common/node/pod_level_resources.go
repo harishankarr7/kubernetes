@@ -286,17 +286,16 @@ func podLevelResourcesTests(f *framework.Framework) {
 			},
 		},
 		{
-			name:         "Burstable QoS pod, pod resources requests, container resources limits",
+			name:         "Guaranteed QoS pod, pod resources requests, container resources limits",
 			podResources: &cgroups.ContainerResources{CPUReq: "100m", MemReq: "100Mi"},
 			containers: []containerInfo{
 				{Name: "c1", Resources: &cgroups.ContainerResources{CPULim: "50m", MemLim: "50Mi"}},
 				{Name: "c2", Resources: &cgroups.ContainerResources{CPULim: "50m", MemLim: "50Mi"}},
 			},
 			expected: expectedPodConfig{
-				qos:               v1.PodQOSBurstable,
+				qos:               v1.PodQOSGuaranteed,
 				totalPodResources: &cgroups.ContainerResources{CPUReq: "100m", CPULim: "100m", MemReq: "100Mi", MemLim: "100Mi"},
 			},
-			expectedPodLevelResourcesOverride: &cgroups.ContainerResources{CPUReq: "100m", MemReq: "100Mi"},
 		},
 		{
 			name:         "Burstable QoS pod, pod resources requests, partial container resources limits",
@@ -314,22 +313,16 @@ func podLevelResourcesTests(f *framework.Framework) {
 			expectedPodLevelResourcesOverride: &cgroups.ContainerResources{CPUReq: "100m", MemReq: "100Mi"},
 		},
 		{
-			name:         "Burstable QoS pod, pod resources requests, container resources requests and limits",
+			name:         "Guaranteed QoS pod, pod resources requests, container resources requests and limits",
 			podResources: &cgroups.ContainerResources{CPUReq: "100m", MemReq: "100Mi"},
 			containers: []containerInfo{
 				{Name: "c1", Resources: &cgroups.ContainerResources{CPUReq: "30m", CPULim: "30m", MemReq: "30Mi", MemLim: "30Mi"}},
 				{Name: "c2", Resources: &cgroups.ContainerResources{CPUReq: "30m", CPULim: "30m", MemReq: "30Mi", MemLim: "30Mi"}},
 			},
 			expected: expectedPodConfig{
-				qos: v1.PodQOSBurstable,
-				// At first glance, this may seem invalid. However, the value of CPUReq is only used
-				// to calculate the ratio for cpu.weight (i.e., CPU shares), and the absolute value
-				// of CPUReq is not directly applied. Therefore, it’s not a problem even if CPUReq
-				// exceeds CPULim. Similarly, when the MemoryQoS feature is disabled, MemReq is not
-				// used for memory.min, so it’s also fine for MemReq to exceed MemLim.
-				totalPodResources: &cgroups.ContainerResources{CPUReq: "100m", CPULim: "60m", MemReq: "100Mi", MemLim: "60Mi"},
+				qos:               v1.PodQOSGuaranteed,
+				totalPodResources: &cgroups.ContainerResources{CPUReq: "100m", CPULim: "100m", MemReq: "100Mi", MemLim: "100Mi"},
 			},
-			expectedPodLevelResourcesOverride: &cgroups.ContainerResources{CPUReq: "100m", MemReq: "100Mi"},
 		},
 		{
 			name:         "Burstable QoS pod, no container resources",
@@ -471,3 +464,64 @@ func verifyContainersCgroupLimits(f *framework.Framework, pod *v1.Pod) error {
 	}
 	return utilerrors.NewAggregate(errs)
 }
+
+// podLevelResourcesFixUpdateDefaultingTests contains tests that require both
+// PodLevelResources and PodLevelResourcesFixUpdateDefaulting feature gates.
+func podLevelResourcesFixUpdateDefaultingTests(f *framework.Framework) {
+	// When pod-level requests are set and all containers define limits, pod-level
+	// limits are auto-defaulted to the aggregated container limits. Since req==lim
+	// after defaulting, the pod gets Guaranteed QoS.
+	ginkgo.It("Guaranteed QoS pod, pod resources requests, container resources limits auto-defaulted", func(ctx context.Context) {
+		containers := []containerInfo{
+			{Name: "c1", Resources: &cgroups.ContainerResources{CPULim: "50m", MemLim: "50Mi"}},
+			{Name: "c2", Resources: &cgroups.ContainerResources{CPULim: "50m", MemLim: "50Mi"}},
+		}
+		podResources := &cgroups.ContainerResources{CPUReq: "100m", MemReq: "100Mi"}
+		expectedResources := &cgroups.ContainerResources{CPUReq: "100m", CPULim: "100m", MemReq: "100Mi", MemLim: "100Mi"}
+
+		podMetadata := makeObjectMetadata("testpod", f.Namespace.Name)
+		testPod := makePod(&podMetadata, podResources, containers)
+
+		ginkgo.By("creating pod")
+		podClient := e2epod.NewPodClient(f)
+		pod := podClient.CreateSync(ctx, testPod)
+
+		ginkgo.By("verifying pod resources are as expected")
+		verifyPodResources(*pod, podResources, expectedResources)
+
+		ginkgo.By("verifying pod QoS as expected")
+		verifyQoS(*pod, v1.PodQOSGuaranteed)
+
+		ginkgo.By("verifying pod cgroup values")
+		err := cgroups.VerifyPodCgroups(ctx, f, pod, expectedResources)
+		framework.ExpectNoError(err, "failed to verify pod's cgroup values: %v", err)
+
+		ginkgo.By("verifying containers cgroup limits are same as pod container's cgroup limits")
+		err = verifyContainersCgroupLimits(f, pod)
+		framework.ExpectNoError(err, "failed to verify containers cgroup values: %v", err)
+
+		ginkgo.By("deleting pod")
+		delErr := e2epod.DeletePodWithWait(ctx, f.ClientSet, pod)
+		framework.ExpectNoError(delErr, "failed to delete pod %s", delErr)
+	})
+}
+
+var _ = SIGDescribe("Pod Level Resources Fix Update Defaulting", framework.WithSerial(), feature.PodLevelResources, feature.PodLevelResourcesFixUpdateDefaulting, framework.WithFeatureGate(features.PodLevelResources), framework.WithFeatureGate(features.PodLevelResourcesFixUpdateDefaulting), func() {
+	f := framework.NewDefaultFramework("pod-level-resources-fix-defaulting-tests")
+	f.NamespacePodSecurityLevel = admissionapi.LevelPrivileged
+
+	ginkgo.BeforeEach(func(ctx context.Context) {
+		_, err := e2enode.GetRandomReadySchedulableNode(ctx, f.ClientSet)
+		framework.ExpectNoError(err)
+
+		if framework.NodeOSDistroIs("windows") {
+			e2eskipper.Skipf("not supported on windows -- skipping")
+		}
+
+		if !isCgroupv2Node(f, ctx) {
+			e2eskipper.Skipf("not supported on cgroupv1 -- skipping")
+		}
+	})
+
+	podLevelResourcesFixUpdateDefaultingTests(f)
+})
